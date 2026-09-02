@@ -9,6 +9,12 @@ export const SOCKET_EVENTS = {
   // Host events
   HOST_GET_STATUS: 'host:get_status',
   HOST_STATUS_UPDATE: 'host:status_update',
+  HOST_START_GAME: 'host:start_game',
+  HOST_START_ROYALE: 'host:start_royale',
+  HOST_RESET_ROOM: 'host:reset_room',
+  HOST_SIMULATE_PLAYER: 'host:simulate_player',
+  HOST_SIMULATE_CHALLENGE: 'host:simulate_challenge',
+  HOST_REMOVE_PLAYER: 'host:remove_player',
   
   // Player lifecycle
   PLAYER_REGISTER: 'player:register',
