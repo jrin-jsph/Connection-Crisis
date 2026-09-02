@@ -7,6 +7,7 @@ import { SOCKET_EVENTS, PLAYER_STATUS, CHALLENGE_STATUS } from '../shared/events
 import { CONFIG } from '../shared/constants.js';
 import { dbRepository } from '../database/index.js';
 import { defaultHotspotController, createHotspotController } from '../network/index.js';
+import { doppelgangerDetector } from './doppelganger.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -86,6 +87,32 @@ function buildHostStatusPayload() {
 
 function broadcastHostStatus() {
   io.emit(SOCKET_EVENTS.HOST_STATUS_UPDATE, buildHostStatusPayload());
+}
+
+function checkAndTriggerDoppelganger(newPlayer) {
+  const activeContenders = Array.from(players.values()).filter(
+    p => p.status === PLAYER_STATUS.ACTIVE && p.playerId !== newPlayer.playerId
+  );
+
+  const challenge = doppelgangerDetector.findDoppelganger(newPlayer, activeContenders);
+  if (challenge) {
+    activeChallenges.set(challenge.challengeId, challenge);
+    const pA = players.get(challenge.playerA.playerId);
+    const pB = players.get(challenge.playerB.playerId);
+    if (pA) pA.status = PLAYER_STATUS.IN_CHALLENGE;
+    if (pB) pB.status = PLAYER_STATUS.IN_CHALLENGE;
+
+    dbRepository.saveChallenge(challenge);
+    addActivityLog(
+      `⚡ DOPPELGANGER DETECTED! ${challenge.playerA.name} vs ${challenge.playerB.name} (${Math.round(challenge.similarityScore * 100)}% similarity)`,
+      'challenge'
+    );
+
+    io.emit(SOCKET_EVENTS.CHALLENGE_CREATED, { challenge });
+    broadcastHostStatus();
+    return challenge;
+  }
+  return null;
 }
 
 // REST Endpoints
@@ -181,6 +208,9 @@ io.on('connection', (socket) => {
     // Authoritative broadcast
     io.emit(SOCKET_EVENTS.PLAYER_JOINED, { player: playerData });
     broadcastHostStatus();
+
+    // Check for Doppelgangers automatically
+    checkAndTriggerDoppelganger(playerData);
 
     if (callback) {
       callback({ success: true, player: playerData });
@@ -312,7 +342,8 @@ io.on('connection', (socket) => {
     activeChallenges.clear();
     activeGames.clear();
     connectedSockets.clear();
-    addActivityLog('Host reset the game room. All sessions cleared.', 'warning');
+    doppelgangerDetector.clearHistory();
+    addActivityLog('Host reset the game room. All sessions and challenge history cleared.', 'warning');
     broadcastHostStatus();
     if (callback) callback({ success: true, message: 'Room has been reset.' });
   });
@@ -348,6 +379,9 @@ io.on('connection', (socket) => {
     
     io.emit(SOCKET_EVENTS.PLAYER_JOINED, { player: simPlayer });
     broadcastHostStatus();
+
+    // Check for Doppelgangers automatically
+    checkAndTriggerDoppelganger(simPlayer);
 
     if (callback) callback({ success: true, player: simPlayer });
   });
