@@ -6,7 +6,7 @@ import os from 'os';
 import { SOCKET_EVENTS, PLAYER_STATUS, CHALLENGE_STATUS } from '../shared/events.js';
 import { CONFIG } from '../shared/constants.js';
 import { dbRepository } from '../database/index.js';
-import { MockHotspotController } from '../network/index.js';
+import { defaultHotspotController, createHotspotController } from '../network/index.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -22,7 +22,7 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || CONFIG.DEFAULT_PORT;
-const hotspotController = new MockHotspotController();
+const hotspotController = defaultHotspotController;
 
 // Authoritative In-Memory Game State
 const connectedSockets = new Map(); // socketId -> { playerId, sessionId }
