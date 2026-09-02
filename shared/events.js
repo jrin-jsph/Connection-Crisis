@@ -16,13 +16,15 @@ export const SOCKET_EVENTS = {
   HOST_SIMULATE_CHALLENGE: 'host:simulate_challenge',
   HOST_REMOVE_PLAYER: 'host:remove_player',
   
-  // Player lifecycle
+  // Player lifecycle (Authoritative)
   PLAYER_REGISTER: 'player:register',
   PLAYER_REGISTERED: 'player:registered',
   PLAYER_JOINED: 'player:joined',
-  PLAYER_LEFT: 'player:left',
+  PLAYER_DISCONNECTED: 'player:disconnected',
   PLAYER_RECONNECTED: 'player:reconnected',
   PLAYER_STATUS_UPDATE: 'player:status_update',
+  PLAYER_REJOIN: 'player:rejoin',
+  PLAYER_ELIMINATED: 'player:eliminated',
   
   // Challenge & Doppelganger
   CHALLENGE_CREATED: 'challenge:created',
@@ -30,16 +32,15 @@ export const SOCKET_EVENTS = {
   CHALLENGE_STARTED: 'challenge:started',
   CHALLENGE_TIMEOUT: 'challenge:timeout',
   
-  // Minigame Engine
+  // Minigame Engine (Server Authority)
   GAME_SELECTED: 'game:selected',
-  GAME_START: 'game:start',
+  GAME_STARTED: 'game:started',
   GAME_ACTION: 'game:action',
+  SCORE_UPDATED: 'score:updated',
   GAME_STATE_UPDATE: 'game:state_update',
   GAME_FINISHED: 'game:finished',
   
-  // Elimination & Royale
-  PLAYER_ELIMINATED: 'player:eliminated',
-  PLAYER_REJOIN: 'player:rejoin',
+  // Royale Mode
   ROYALE_STARTED: 'royale:started',
   ROYALE_ROUND_START: 'royale:round_start',
   ROYALE_ROUND_FINISH: 'royale:round_finish',
