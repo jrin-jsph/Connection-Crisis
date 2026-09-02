@@ -110,6 +110,12 @@ function App() {
               </span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.06)', paddingBottom: '0.5rem' }}>
+              <span style={{ color: 'var(--text-muted)' }}>Database Engine:</span>
+              <span className="badge badge-online" style={{ padding: '0.15rem 0.6rem', fontSize: '0.78rem' }}>
+                {serverInfo?.database?.type || 'In-Memory DB'} (Permanent Store)
+              </span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.06)', paddingBottom: '0.5rem' }}>
               <span style={{ color: 'var(--text-muted)' }}>Socket.IO Status:</span>
               <span style={{ fontWeight: 700, color: isConnected ? '#34d399' : '#f87171' }}>
                 {isConnected ? 'Real-Time Connected' : 'Waiting for connection...'}

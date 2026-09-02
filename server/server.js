@@ -46,6 +46,7 @@ function getHostIpAddresses() {
 
 // REST endpoints
 app.get('/api/health', (req, res) => {
+  const dbStatus = dbRepository.getStatus();
   res.json({
     status: 'online',
     appName: 'Connection Crisis Server',
@@ -54,17 +55,24 @@ app.get('/api/health', (req, res) => {
     playerCount: players.size,
     hostIps: getHostIpAddresses(),
     port: PORT,
+    database: dbStatus,
     timestamp: new Date().toISOString()
   });
 });
 
 app.get('/api/host/status', async (req, res) => {
   const hotspotStatus = hotspotController.getStatus();
+  const dbStatus = dbRepository.getStatus();
+  const stats = await dbRepository.getStatistics();
+  const recentMatches = await dbRepository.getMatchHistory(5);
   res.json({
     serverOnline: true,
     port: PORT,
     hostIps: getHostIpAddresses(),
     hotspotStatus,
+    database: dbStatus,
+    statistics: stats,
+    recentMatches,
     playerCount: players.size,
     players: Array.from(players.values())
   });
