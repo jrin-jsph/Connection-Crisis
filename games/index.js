@@ -1,48 +1,21 @@
-// Games module root & base GameManager abstraction
+export { BaseGame } from './BaseGame.js';
+export { GameManager, gameManager } from './GameManager.js';
+export { ReactionRushGame } from './ReactionRush.js';
+export { RockPaperScissorsGame } from './RockPaperScissors.js';
+export { MemoryMatchGame } from './MemoryMatch.js';
+export { QuickMathGame } from './QuickMath.js';
+export { TargetClickGame } from './TargetClick.js';
 
-export class BaseGame {
-  constructor(gameId, type, playerAId, playerBId) {
-    this.gameId = gameId;
-    this.type = type;
-    this.playerAId = playerAId;
-    this.playerBId = playerBId;
-    this.state = {};
-    this.isFinished = false;
-    this.winnerId = null;
-    this.loserId = null;
-  }
+import { gameManager } from './GameManager.js';
+import { ReactionRushGame } from './ReactionRush.js';
+import { RockPaperScissorsGame } from './RockPaperScissors.js';
+import { MemoryMatchGame } from './MemoryMatch.js';
+import { QuickMathGame } from './QuickMath.js';
+import { TargetClickGame } from './TargetClick.js';
 
-  initialize() {}
-  start() {}
-  receiveAction(playerId, action) {}
-  validateAction(playerId, action) { return true; }
-  calculateScore() { return {}; }
-  finish(winnerId, loserId) {
-    this.isFinished = true;
-    this.winnerId = winnerId;
-    this.loserId = loserId;
-  }
-  determineWinner() { return null; }
-}
-
-export class GameManager {
-  constructor() {
-    this.activeGames = new Map();
-  }
-
-  createGame(gameId, type, playerAId, playerBId) {
-    const game = new BaseGame(gameId, type, playerAId, playerBId);
-    this.activeGames.set(gameId, game);
-    return game;
-  }
-
-  getGame(gameId) {
-    return this.activeGames.get(gameId);
-  }
-
-  removeGame(gameId) {
-    return this.activeGames.delete(gameId);
-  }
-}
-
-export const gameManager = new GameManager();
+// Auto-register all 5 minigames
+gameManager.registerGame('reaction_rush', ReactionRushGame);
+gameManager.registerGame('rock_paper_scissors', RockPaperScissorsGame);
+gameManager.registerGame('memory_match', MemoryMatchGame);
+gameManager.registerGame('quick_math', QuickMathGame);
+gameManager.registerGame('target_click', TargetClickGame);

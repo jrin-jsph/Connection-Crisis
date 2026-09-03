@@ -4,6 +4,16 @@ import {
   Clock, Wifi, AlertCircle, LogOut, Loader2, Users 
 } from 'lucide-react';
 import { SOCKET_EVENTS, PLAYER_STATUS } from '../../../shared/events.js';
+import ChallengeScreen from './ChallengeScreen.jsx';
+import GameSelectionScreen from './GameSelectionScreen.jsx';
+import WinnerScreen from './WinnerScreen.jsx';
+import LoserScreen from './LoserScreen.jsx';
+import RoyaleChampionScreen from './RoyaleChampionScreen.jsx';
+import ReactionRush from './minigames/ReactionRush.jsx';
+import RockPaperScissors from './minigames/RockPaperScissors.jsx';
+import MemoryMatch from './minigames/MemoryMatch.jsx';
+import QuickMath from './minigames/QuickMath.jsx';
+import TargetClick from './minigames/TargetClick.jsx';
 
 function getDeviceName() {
   const ua = navigator.userAgent;
@@ -18,6 +28,11 @@ function getDeviceName() {
 export default function PlayerView({ socket, isConnected, onSwitchToHost }) {
   const [playerName, setPlayerName] = useState('');
   const [playerData, setPlayerData] = useState(null);
+  const [activeChallenge, setActiveChallenge] = useState(null);
+  const [activeSelection, setActiveSelection] = useState(null);
+  const [activeGame, setActiveGame] = useState(null);
+  const [matchOutcome, setMatchOutcome] = useState(null); // { type: 'WIN'|'LOSS', ... }
+  const [royaleChampion, setRoyaleChampion] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [lobbyStats, setLobbyStats] = useState({ playerCount: 0, activeCount: 0 });
@@ -44,20 +59,109 @@ export default function PlayerView({ socket, isConnected, onSwitchToHost }) {
         playerCount: data.playerCount || 0,
         activeCount: data.activeCount || 0
       });
-      // Check if current player status changed (e.g. eliminated or challenged)
+
+      // Update current player info
       if (playerData?.playerId) {
         const current = data.players?.find(p => p.playerId === playerData.playerId);
-        if (current && current.status !== playerData.status) {
+        if (current && (current.status !== playerData.status || current.eliminated !== playerData.eliminated)) {
           setPlayerData(prev => ({ ...prev, ...current }));
           sessionStorage.setItem('cc_player_session', JSON.stringify({ ...playerData, ...current }));
+        }
+
+        // Check if there is an active challenge for current player
+        const relevantChallenge = data.activeChallenges?.find(
+          ch => ch.playerA?.playerId === playerData.playerId || ch.playerB?.playerId === playerData.playerId
+        );
+
+        if (relevantChallenge) {
+          setActiveChallenge(relevantChallenge);
+        } else if (activeChallenge) {
+          setActiveChallenge(null);
         }
       }
     });
 
+    const handleChallengeCreated = (data) => {
+      const ch = data.challenge;
+      if (playerData?.playerId && (ch.playerA?.playerId === playerData.playerId || ch.playerB?.playerId === playerData.playerId)) {
+        setActiveChallenge(ch);
+      }
+    };
+
+    const handleChallengeTimeout = (data) => {
+      if (activeChallenge?.challengeId === data.challengeId) {
+        setTimeout(() => {
+          setActiveChallenge(null);
+          setActiveSelection(null);
+        }, 4000);
+      }
+    };
+
+    const handleGameSelected = (data) => {
+      if (playerData?.playerId && (data.playerA?.playerId === playerData.playerId || data.playerB?.playerId === playerData.playerId)) {
+        setActiveSelection(data);
+      }
+    };
+
+    const handleGameStarted = (data) => {
+      if (playerData?.playerId && (data.playerAId === playerData.playerId || data.playerBId === playerData.playerId)) {
+        setActiveSelection(null);
+        setActiveGame(data);
+        setMatchOutcome(null);
+      }
+    };
+
+    const handleGameFinished = (data) => {
+      if (playerData?.playerId && (data.winnerId === playerData.playerId || data.loserId === playerData.playerId)) {
+        const isWinner = data.winnerId === playerData.playerId;
+        const opponentName = isWinner ? data.loserName : data.winnerName;
+        setMatchOutcome({
+          type: isWinner ? 'WIN' : 'LOSS',
+          opponentName,
+          result: data
+        });
+        setActiveGame(null);
+        setActiveChallenge(null);
+      }
+    };
+
+    const handlePlayerEliminated = (data) => {
+      if (playerData?.playerId === data.playerId) {
+        setPlayerData(prev => ({ ...prev, status: PLAYER_STATUS.ELIMINATED, eliminated: true }));
+        setMatchOutcome({
+          type: 'LOSS',
+          result: data
+        });
+      }
+    };
+
+    const handleRoyaleFinished = (data) => {
+      setRoyaleChampion(data);
+      setActiveGame(null);
+      setActiveChallenge(null);
+      setActiveSelection(null);
+      setMatchOutcome(null);
+    };
+
+    socket.on(SOCKET_EVENTS.CHALLENGE_CREATED, handleChallengeCreated);
+    socket.on(SOCKET_EVENTS.CHALLENGE_TIMEOUT, handleChallengeTimeout);
+    socket.on(SOCKET_EVENTS.GAME_SELECTED, handleGameSelected);
+    socket.on(SOCKET_EVENTS.GAME_STARTED, handleGameStarted);
+    socket.on(SOCKET_EVENTS.GAME_FINISHED, handleGameFinished);
+    socket.on(SOCKET_EVENTS.PLAYER_ELIMINATED, handlePlayerEliminated);
+    socket.on(SOCKET_EVENTS.ROYALE_FINISHED, handleRoyaleFinished);
+
     return () => {
       socket.off(SOCKET_EVENTS.HOST_STATUS_UPDATE);
+      socket.off(SOCKET_EVENTS.CHALLENGE_CREATED, handleChallengeCreated);
+      socket.off(SOCKET_EVENTS.CHALLENGE_TIMEOUT, handleChallengeTimeout);
+      socket.off(SOCKET_EVENTS.GAME_SELECTED, handleGameSelected);
+      socket.off(SOCKET_EVENTS.GAME_STARTED, handleGameStarted);
+      socket.off(SOCKET_EVENTS.GAME_FINISHED, handleGameFinished);
+      socket.off(SOCKET_EVENTS.PLAYER_ELIMINATED, handlePlayerEliminated);
+      socket.off(SOCKET_EVENTS.ROYALE_FINISHED, handleRoyaleFinished);
     };
-  }, [socket, playerData]);
+  }, [socket, playerData, activeChallenge]);
 
   const handleRegister = (e) => {
     e?.preventDefault();
@@ -101,8 +205,176 @@ export default function PlayerView({ socket, isConnected, onSwitchToHost }) {
   const handleLeaveLobby = () => {
     sessionStorage.removeItem('cc_player_session');
     setPlayerData(null);
+    setActiveChallenge(null);
+    setActiveGame(null);
+    setRoyaleChampion(null);
     setPlayerName('');
   };
+
+  // If Royale has crowned THE ONLY REAL ONE champion
+  if (playerData && royaleChampion) {
+    return (
+      <RoyaleChampionScreen
+        champion={royaleChampion.champion}
+        isCurrentPlayer={playerData.playerId === royaleChampion.champion?.playerId}
+        totalRounds={royaleChampion.totalRounds}
+        onReturnToLobby={() => {
+          setRoyaleChampion(null);
+        }}
+      />
+    );
+  }
+
+  // If player won the showdown, show WinnerScreen
+  if (playerData && matchOutcome?.type === 'WIN') {
+    return (
+      <WinnerScreen
+        player={playerData}
+        opponentName={matchOutcome.opponentName}
+        matchResult={matchOutcome.result}
+        onKeepPlaying={() => {
+          setMatchOutcome(null);
+          setActiveGame(null);
+          setActiveChallenge(null);
+        }}
+      />
+    );
+  }
+
+  // If player lost the showdown / eliminated, show LoserScreen
+  if (playerData && (matchOutcome?.type === 'LOSS' || playerData.status === PLAYER_STATUS.ELIMINATED || playerData.eliminated)) {
+    return (
+      <LoserScreen
+        player={playerData}
+        opponentName={matchOutcome?.opponentName}
+        matchResult={matchOutcome?.result}
+        onSpectate={() => {
+          setMatchOutcome(null);
+        }}
+      />
+    );
+  }
+
+  // If player is in 3-second random game selection phase
+  if (playerData && activeSelection) {
+    return (
+      <GameSelectionScreen
+        selectedGameType={activeSelection.selectedGameType}
+        durationSec={activeSelection.durationSec || 3}
+      />
+    );
+  }
+
+  // If player is in active Minigame, show appropriate game
+  if (playerData && (activeGame || activeChallenge?.status === 'GAME_RUNNING')) {
+    const gData = activeGame || {
+      gameId: 'game_' + activeChallenge?.challengeId,
+      playerAId: activeChallenge?.playerA?.playerId,
+      playerBId: activeChallenge?.playerB?.playerId,
+      gameType: activeGame?.gameType || 'reaction_rush'
+    };
+
+    const isRPS = gData.gameType === 'rock_paper_scissors';
+    const isMemory = gData.gameType === 'memory_match';
+    const isMath = gData.gameType === 'quick_math';
+    const isTarget = gData.gameType === 'target_click';
+
+    if (isTarget) {
+      return (
+        <TargetClick
+          socket={socket}
+          isConnected={isConnected}
+          gameData={gData}
+          currentPlayer={playerData}
+          onGameFinished={(result) => {
+            setTimeout(() => {
+              setActiveGame(null);
+              setActiveChallenge(null);
+            }, 5000);
+          }}
+        />
+      );
+    }
+
+    if (isMath) {
+      return (
+        <QuickMath
+          socket={socket}
+          isConnected={isConnected}
+          gameData={gData}
+          currentPlayer={playerData}
+          onGameFinished={(result) => {
+            setTimeout(() => {
+              setActiveGame(null);
+              setActiveChallenge(null);
+            }, 5000);
+          }}
+        />
+      );
+    }
+
+    if (isMemory) {
+      return (
+        <MemoryMatch
+          socket={socket}
+          isConnected={isConnected}
+          gameData={gData}
+          currentPlayer={playerData}
+          onGameFinished={(result) => {
+            setTimeout(() => {
+              setActiveGame(null);
+              setActiveChallenge(null);
+            }, 5000);
+          }}
+        />
+      );
+    }
+
+    if (isRPS) {
+      return (
+        <RockPaperScissors
+          socket={socket}
+          isConnected={isConnected}
+          gameData={gData}
+          currentPlayer={playerData}
+          onGameFinished={(result) => {
+            setTimeout(() => {
+              setActiveGame(null);
+              setActiveChallenge(null);
+            }, 5000);
+          }}
+        />
+      );
+    }
+
+    return (
+      <ReactionRush
+        socket={socket}
+        isConnected={isConnected}
+        gameData={gData}
+        currentPlayer={playerData}
+        onGameFinished={(result) => {
+          setTimeout(() => {
+            setActiveGame(null);
+            setActiveChallenge(null);
+          }, 5000);
+        }}
+      />
+    );
+  }
+
+  // If player is in an active Doppelganger Challenge countdown, show ChallengeScreen
+  if (playerData && activeChallenge) {
+    return (
+      <ChallengeScreen
+        socket={socket}
+        isConnected={isConnected}
+        challenge={activeChallenge}
+        currentPlayer={playerData}
+        onLeave={handleLeaveLobby}
+      />
+    );
+  }
 
   return (
     <div className="player-container" style={{ maxWidth: 480, margin: '0 auto', padding: '1.5rem 1rem', minHeight: '100vh', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>

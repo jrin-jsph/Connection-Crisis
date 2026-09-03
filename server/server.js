@@ -7,7 +7,11 @@ import { SOCKET_EVENTS, PLAYER_STATUS, CHALLENGE_STATUS } from '../shared/events
 import { CONFIG } from '../shared/constants.js';
 import { dbRepository } from '../database/index.js';
 import { defaultHotspotController, createHotspotController } from '../network/index.js';
-import { doppelgangerDetector } from './doppelganger.js';
+import { doppelgangerDetector, calculateSimilarity } from './doppelganger.js';
+import { ChallengeManager } from './challengeManager.js';
+import { RoyaleManager } from './royaleManager.js';
+import { gameManager } from '../games/index.js';
+import { sanitizePlayerName, RateLimiter, validatePlayerAction, isHostAuthorized } from './security.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -25,13 +29,18 @@ const io = new Server(server, {
 const PORT = process.env.PORT || CONFIG.DEFAULT_PORT;
 const hotspotController = defaultHotspotController;
 
+// Security & Rate Limiting
+const actionRateLimiter = new RateLimiter({ windowMs: 1000, maxRequests: 20 });
+const regRateLimiter = new RateLimiter({ windowMs: 60000, maxRequests: 12 });
+const hostSockets = new Set();
+
 // Authoritative In-Memory Game State
 const connectedSockets = new Map(); // socketId -> { playerId, sessionId }
 const players = new Map(); // playerId -> playerData
 const sessions = new Map(); // sessionId -> playerId
-const activeChallenges = new Map(); // challengeId -> challengeData
 const activeGames = new Map(); // gameId -> gameState
 const activityLog = []; // [{ id, text, type, timestamp }]
+const eliminatedNames = new Set(); // normalized names of eliminated players (banned from rejoining)
 
 function addActivityLog(text, type = 'info') {
   const item = {
@@ -64,9 +73,11 @@ function getHostIpAddresses() {
 
 function buildHostStatusPayload() {
   const allPlayers = Array.from(players.values());
-  const activePlayers = allPlayers.filter(p => p.status === PLAYER_STATUS.ACTIVE || p.status === PLAYER_STATUS.IN_CHALLENGE || p.status === PLAYER_STATUS.IN_GAME);
+  const activePlayers = allPlayers.filter(
+    p => p.status === PLAYER_STATUS.ACTIVE || p.status === PLAYER_STATUS.IN_CHALLENGE || p.status === PLAYER_STATUS.IN_GAME
+  );
   const eliminatedPlayers = allPlayers.filter(p => p.status === PLAYER_STATUS.ELIMINATED);
-  const challenges = Array.from(activeChallenges.values());
+  const challenges = challengeManager ? challengeManager.getAllChallenges() : [];
 
   return {
     serverOnline: true,
@@ -80,6 +91,7 @@ function buildHostStatusPayload() {
     players: allPlayers,
     activeChallenges: challenges,
     eliminatedPlayers: eliminatedPlayers,
+    royale: royaleManager ? royaleManager.getStatus() : null,
     activityLog: activityLog.slice(0, 35),
     timestamp: Date.now()
   };
@@ -89,28 +101,51 @@ function broadcastHostStatus() {
   io.emit(SOCKET_EVENTS.HOST_STATUS_UPDATE, buildHostStatusPayload());
 }
 
+async function eliminatePlayerHelper(loser, winner, reason = 'MATCH_DEFEAT') {
+  if (winner) {
+    winner.status = PLAYER_STATUS.ACTIVE;
+    winner.eliminated = false;
+    await dbRepository.savePlayer(winner);
+  }
+  if (loser) {
+    loser.status = PLAYER_STATUS.ELIMINATED;
+    loser.eliminated = true;
+    const normLoser = loser.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    eliminatedNames.add(normLoser);
+    await dbRepository.savePlayer(loser);
+    io.emit(SOCKET_EVENTS.PLAYER_ELIMINATED, {
+      playerId: loser.playerId,
+      name: loser.name,
+      eliminatedAt: new Date().toISOString(),
+      reason
+    });
+  }
+  broadcastHostStatus();
+}
+
+// Instantiate Challenge & Royale Managers
+const challengeManager = new ChallengeManager(io, addActivityLog, broadcastHostStatus);
+const royaleManager = new RoyaleManager(io, addActivityLog, broadcastHostStatus, eliminatePlayerHelper);
+
 function checkAndTriggerDoppelganger(newPlayer) {
   const activeContenders = Array.from(players.values()).filter(
     p => p.status === PLAYER_STATUS.ACTIVE && p.playerId !== newPlayer.playerId
   );
 
-  const challenge = doppelgangerDetector.findDoppelganger(newPlayer, activeContenders);
-  if (challenge) {
-    activeChallenges.set(challenge.challengeId, challenge);
-    const pA = players.get(challenge.playerA.playerId);
-    const pB = players.get(challenge.playerB.playerId);
-    if (pA) pA.status = PLAYER_STATUS.IN_CHALLENGE;
-    if (pB) pB.status = PLAYER_STATUS.IN_CHALLENGE;
+  for (const other of activeContenders) {
+    if (doppelgangerDetector.hasPairBeenChallenged(newPlayer.playerId, other.playerId)) continue;
+    
+    const score = calculateSimilarity(newPlayer.name, other.name);
+    if (score >= (CONFIG.SIMILARITY_THRESHOLD || 0.85)) {
+      doppelgangerDetector.markPairChallenged(newPlayer.playerId, other.playerId);
+      
+      const pA = newPlayer;
+      const pB = other;
+      pA.status = PLAYER_STATUS.IN_CHALLENGE;
+      pB.status = PLAYER_STATUS.IN_CHALLENGE;
 
-    dbRepository.saveChallenge(challenge);
-    addActivityLog(
-      `⚡ DOPPELGANGER DETECTED! ${challenge.playerA.name} vs ${challenge.playerB.name} (${Math.round(challenge.similarityScore * 100)}% similarity)`,
-      'challenge'
-    );
-
-    io.emit(SOCKET_EVENTS.CHALLENGE_CREATED, { challenge });
-    broadcastHostStatus();
-    return challenge;
+      return challengeManager.createChallenge(pA, pB, score);
+    }
   }
   return null;
 }
@@ -153,37 +188,73 @@ io.on('connection', (socket) => {
       const player = players.get(pid);
       if (player) {
         player.socketId = socket.id;
-        if (player.status === PLAYER_STATUS.DISCONNECTED) {
-          player.status = player.eliminated ? PLAYER_STATUS.ELIMINATED : PLAYER_STATUS.ACTIVE;
+
+        // If player was eliminated, keep them in eliminated state
+        if (player.eliminated || player.status === PLAYER_STATUS.ELIMINATED) {
+          player.status = PLAYER_STATUS.ELIMINATED;
+          connectedSockets.set(socket.id, { playerId: player.playerId, sessionId });
+          if (callback) callback({ success: true, player, isEliminated: true });
+          return;
         }
+
+        // Restore active player session
+        player.status = PLAYER_STATUS.ACTIVE;
         connectedSockets.set(socket.id, { playerId: player.playerId, sessionId });
-        addActivityLog(`Player reconnected: ${player.name}`, 'player');
+        addActivityLog(`Player reconnected: ${player.name} (Session Restored)`, 'player');
         
-        // Broadcast reconnected event
         io.emit(SOCKET_EVENTS.PLAYER_RECONNECTED, { player });
         broadcastHostStatus();
 
-        if (callback) callback({ success: true, player });
+        if (callback) callback({ success: true, player, restored: true });
         return;
       }
     }
-    if (callback) callback({ success: false, message: 'Session not found' });
+    if (callback) callback({ success: false, message: 'Session not found or expired' });
   });
 
-  // Host requesting status
+  // Host registration and status
+  socket.on('host:register', (data, callback) => {
+    hostSockets.add(socket.id);
+    if (callback) callback({ success: true, isHost: true });
+  });
+
   socket.on(SOCKET_EVENTS.HOST_GET_STATUS, () => {
+    hostSockets.add(socket.id);
     socket.emit(SOCKET_EVENTS.HOST_STATUS_UPDATE, buildHostStatusPayload());
   });
 
-  // 1. Player Registration (Authoritative)
+  // 1. Player Registration
   socket.on(SOCKET_EVENTS.PLAYER_REGISTER, async (payload, callback) => {
-    const { name, device } = payload || {};
-    if (!name || typeof name !== 'string' || name.trim().length === 0) {
-      if (callback) callback({ success: false, error: 'Valid player name is required' });
+    // A. Rate Limiting Check
+    if (!regRateLimiter.isAllowed(socket.id)) {
+      if (callback) callback({ success: false, error: 'RATE_LIMIT_EXCEEDED: Too many registration attempts. Please wait.' });
       return;
     }
 
-    const trimmedName = name.trim().slice(0, 20);
+    const { name, device } = payload || {};
+    
+    // B. Input Sanitization & XSS Prevention
+    const nameCheck = sanitizePlayerName(name);
+    if (!nameCheck.valid) {
+      if (callback) callback({ success: false, error: nameCheck.error });
+      return;
+    }
+
+    const trimmedName = nameCheck.sanitized;
+    const normalizedName = trimmedName.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    // C. Check if name is banned due to previous elimination
+    if (eliminatedNames.has(normalizedName)) {
+      if (callback) {
+        callback({
+          success: false,
+          banned: true,
+          error: `🚫 NAME BANNED: The moniker "${trimmedName}" was eliminated in a Connection Crisis showdown and cannot rejoin.`
+        });
+      }
+      return;
+    }
+
     const playerId = 'p_' + Math.random().toString(36).substring(2, 9);
     const sessionId = 's_' + Math.random().toString(36).substring(2, 11);
 
@@ -192,7 +263,7 @@ io.on('connection', (socket) => {
       sessionId,
       name: trimmedName,
       socketId: socket.id,
-      device: device || 'Mobile Web',
+      device: device ? String(device).replace(/<[^>]*>?/gm, '').substring(0, 30) : 'Mobile Web',
       status: PLAYER_STATUS.ACTIVE,
       joinedAt: new Date().toISOString(),
       eliminated: false
@@ -205,7 +276,6 @@ io.on('connection', (socket) => {
     await dbRepository.savePlayer(playerData);
     addActivityLog(`Player registered: ${playerData.name} (${playerData.device})`, 'player');
 
-    // Authoritative broadcast
     io.emit(SOCKET_EVENTS.PLAYER_JOINED, { player: playerData });
     broadcastHostStatus();
 
@@ -220,75 +290,145 @@ io.on('connection', (socket) => {
   // 2. Challenge & Doppelganger Management
   socket.on(SOCKET_EVENTS.CHALLENGE_ENTER, (payload, callback) => {
     const { challengeId, playerId } = payload || {};
-    const challenge = activeChallenges.get(challengeId);
-    if (!challenge) {
-      if (callback) callback({ success: false, error: 'Challenge not found' });
-      return;
-    }
-
-    challenge.enteredPlayers = challenge.enteredPlayers || [];
-    if (!challenge.enteredPlayers.includes(playerId)) {
-      challenge.enteredPlayers.push(playerId);
-    }
-
-    if (callback) callback({ success: true, challenge });
-
-    // When both players have entered the challenge arena
-    if (challenge.enteredPlayers.length >= 2 && challenge.status === CHALLENGE_STATUS.COUNTDOWN) {
-      challenge.status = CHALLENGE_STATUS.GAME_RUNNING;
-      const gameId = 'game_' + challengeId;
-      
-      addActivityLog(`Challenge Started: ${challenge.playerAName} VS ${challenge.playerBName}`, 'game');
-      
-      io.emit(SOCKET_EVENTS.CHALLENGE_STARTED, { challenge });
-      io.emit(SOCKET_EVENTS.GAME_STARTED, { 
-        gameId, 
-        challengeId,
-        playerAId: challenge.playerAId,
-        playerBId: challenge.playerBId,
-        gameType: 'reaction_rush'
-      });
-      broadcastHostStatus();
-    }
+    const result = challengeManager.enterPlayer(challengeId, playerId);
+    if (callback) callback(result);
   });
 
   // 3. Authoritative Game Action Handler
   socket.on(SOCKET_EVENTS.GAME_ACTION, async (payload, callback) => {
-    const { gameId, playerId, actionType, actionData } = payload || {};
-    const socketMeta = connectedSockets.get(socket.id);
-    
-    // Validate that action comes from authenticated player
-    if (!socketMeta || socketMeta.playerId !== playerId) {
-      if (callback) callback({ success: false, error: 'Unauthorized game action' });
+    // A. Action Rate Limiter (anti-spam)
+    if (!actionRateLimiter.isAllowed(socket.id)) {
+      if (callback) callback({ success: false, error: 'RATE_LIMIT_EXCEEDED: High-frequency action spam blocked' });
       return;
     }
 
+    // B. Spoof Prevention & Identity Validation
+    const validation = validatePlayerAction(socket, payload, connectedSockets, gameManager);
+    if (!validation.valid) {
+      if (callback) callback({ success: false, error: validation.error });
+      return;
+    }
+
+    const { gameId, playerId, actionType, actionData } = payload || {};
     const player = players.get(playerId);
     if (!player || player.status === PLAYER_STATUS.ELIMINATED) {
       if (callback) callback({ success: false, error: 'Player cannot perform action' });
       return;
     }
 
-    // Server calculates authoritative response
-    const timestamp = Date.now();
-    addActivityLog(`Game Action [${actionType}] from ${player.name}`, 'game');
+    const result = gameManager.handleAction(gameId, playerId, actionType, actionData);
+    if (!result.success) {
+      if (callback) callback(result);
+      return;
+    }
 
-    // Emit Authoritative Score & State update
-    const scoreUpdate = {
-      gameId,
-      playerId,
-      score: 100,
-      timestamp
-    };
+    if (result.completed) {
+      const matchResult = await gameManager.finishGame(gameId, result.winnerId);
+      const winner = players.get(matchResult.winnerId);
+      const loser = players.get(matchResult.loserId);
 
-    io.emit(SOCKET_EVENTS.SCORE_UPDATED, scoreUpdate);
-    io.emit(SOCKET_EVENTS.GAME_STATE_UPDATE, { gameId, lastAction: { playerId, actionType, timestamp } });
+      await eliminatePlayerHelper(loser, winner, result.reason || 'MATCH_DEFEAT');
 
-    if (callback) callback({ success: true, scoreUpdate });
+      // If Royale match is active, notify royale manager
+      await royaleManager.handleMatchCompletion(gameId, matchResult.winnerId, matchResult.loserId, result);
+
+      addActivityLog(`🏆 ${winner?.name || 'Winner'} won! 💀 ${loser?.name || 'Loser'} eliminated from Connection Crisis.`, 'game');
+
+      io.emit(SOCKET_EVENTS.GAME_FINISHED, {
+        gameId,
+        winnerId: matchResult.winnerId,
+        loserId: matchResult.loserId,
+        winnerName: winner?.name,
+        loserName: loser?.name,
+        scores: matchResult.scores,
+        reason: result.reason || 'MATCH_VICTORY',
+        reactionMs: result.reactionMs
+      });
+      broadcastHostStatus();
+    } else {
+      io.emit(SOCKET_EVENTS.GAME_STATE_UPDATE, { gameId, state: result.state });
+    }
+
+    if (callback) callback(result);
   });
+
+  socket.on('game:create', (payload, callback) => {
+    const { gameType, playerAId, playerBId, options } = payload || {};
+    const pA = players.get(playerAId);
+    const pB = players.get(playerBId);
+    if (!pA || !pB) {
+      if (callback) callback({ success: false, error: 'Players not found' });
+      return;
+    }
+    const type = gameType || 'rock_paper_scissors';
+    const gameId = `game_${type}_${Date.now()}`;
+    const game = gameManager.createGame(gameId, type, pA, pB, options);
+    
+    if (type === 'rock_paper_scissors') {
+      game.start(
+        (sec, round) => {
+          io.emit(SOCKET_EVENTS.GAME_STATE_UPDATE, { gameId, state: { secondsRemaining: sec, round } });
+        },
+        (roundRecord, matchFinished, finishRes) => {
+          io.emit(SOCKET_EVENTS.GAME_STATE_UPDATE, { gameId, state: game.getState(true) });
+        }
+      );
+    } else if (type === 'memory_match') {
+      game.start((patternState) => {
+        io.emit(SOCKET_EVENTS.GAME_STATE_UPDATE, { gameId, state: patternState });
+      });
+    } else if (type === 'target_click') {
+      game.start(
+        (sec, currentTarget) => {
+          io.emit(SOCKET_EVENTS.GAME_STATE_UPDATE, { gameId, state: { secondsRemaining: sec, currentTarget, scores: game.scores } });
+        },
+        async (matchResult) => {
+          const winner = players.get(matchResult.winnerId);
+          const loser = players.get(matchResult.loserId);
+          await gameManager.finishGame(gameId, matchResult.winnerId);
+          io.emit(SOCKET_EVENTS.GAME_FINISHED, {
+            gameId,
+            winnerId: matchResult.winnerId,
+            loserId: matchResult.loserId,
+            winnerName: winner?.name,
+            loserName: loser?.name,
+            scores: matchResult.scores,
+            reason: 'TIME_EXPIRED_MOST_POINTS'
+          });
+          broadcastHostStatus();
+        }
+      );
+    } else {
+      game.start();
+    }
+
+    addActivityLog(`Minigame Started: [${type}] between ${pA.name} and ${pB.name}`, 'game');
+
+    io.emit(SOCKET_EVENTS.GAME_STARTED, {
+      gameId,
+      playerAId: pA.playerId,
+      playerBId: pB.playerId,
+      playerA: pA,
+      playerB: pB,
+      gameType: type,
+      gameData: game.getState()
+    });
+
+    if (callback) callback({ success: true, gameId, gameData: game.getState() });
+  });
+
+  function guardHost(callback) {
+    if (!isHostAuthorized(socket, hostSockets)) {
+      addActivityLog(`⚠️ Blocked unauthorized admin action from socket ${socket.id}`, 'security');
+      if (callback) callback({ success: false, error: 'UNAUTHORIZED_HOST_ACTION: Only the host dashboard can perform this action' });
+      return false;
+    }
+    return true;
+  }
 
   // 4. Host Triggers
   socket.on(SOCKET_EVENTS.HOST_START_GAME, (data, callback) => {
+    if (!guardHost(callback)) return;
     const active = Array.from(players.values()).filter(p => p.status === PLAYER_STATUS.ACTIVE);
     if (active.length < 2) {
       if (callback) callback({ success: false, message: 'Need at least 2 active players to start a game' });
@@ -297,51 +437,28 @@ io.on('connection', (socket) => {
 
     const playerA = active[0];
     const playerB = active[1];
-    const challengeId = 'ch_' + Date.now();
-
-    const challenge = {
-      challengeId,
-      playerAId: playerA.playerId,
-      playerAName: playerA.name,
-      playerBId: playerB.playerId,
-      playerBName: playerB.name,
-      status: CHALLENGE_STATUS.COUNTDOWN,
-      countdownRemaining: CONFIG.CHALLENGE_COUNTDOWN_SECONDS,
-      enteredPlayers: [],
-      createdAt: new Date().toISOString()
-    };
-
-    activeChallenges.set(challengeId, challenge);
     playerA.status = PLAYER_STATUS.IN_CHALLENGE;
     playerB.status = PLAYER_STATUS.IN_CHALLENGE;
 
-    addActivityLog(`Host created Challenge: ${playerA.name} VS ${playerB.name}`, 'challenge');
-    
-    io.emit(SOCKET_EVENTS.CHALLENGE_CREATED, { challenge });
-    broadcastHostStatus();
-
+    const challenge = challengeManager.createChallenge(playerA, playerB, 0.95);
     if (callback) callback({ success: true, challenge });
   });
 
   socket.on(SOCKET_EVENTS.HOST_START_ROYALE, (data, callback) => {
-    const active = Array.from(players.values()).filter(p => p.status === PLAYER_STATUS.ACTIVE);
-    const royaleId = 'royale_' + Date.now();
-    
-    addActivityLog(`Connection Crisis Royale Started (${active.length} Contenders)`, 'royale');
-    
-    io.emit(SOCKET_EVENTS.ROYALE_STARTED, { royaleId, contendersCount: active.length });
-    io.emit(SOCKET_EVENTS.ROYALE_ROUND_START, { roundNumber: 1, activeContenders: active.map(p => p.playerId) });
-    broadcastHostStatus();
-    
-    if (callback) callback({ success: true, message: `Royale tournament initiated with ${active.length} contenders.` });
+    if (!guardHost(callback)) return;
+    const res = royaleManager.startRoyale(Array.from(players.values()));
+    if (callback) callback(res);
   });
 
   socket.on(SOCKET_EVENTS.HOST_RESET_ROOM, (data, callback) => {
+    if (!guardHost(callback)) return;
     players.clear();
     sessions.clear();
-    activeChallenges.clear();
     activeGames.clear();
     connectedSockets.clear();
+    eliminatedNames.clear();
+    challengeManager.clearAll();
+    royaleManager.clearAll();
     doppelgangerDetector.clearHistory();
     addActivityLog('Host reset the game room. All sessions and challenge history cleared.', 'warning');
     broadcastHostStatus();
@@ -349,6 +466,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on(SOCKET_EVENTS.HOST_SIMULATE_PLAYER, (data, callback) => {
+    if (!guardHost(callback)) return;
     const sampleNames = ['Jerrin', 'Jerin', 'Alex', 'Aleks', 'Marcus', 'Sophia', 'David', 'Elena', 'Kai', 'Nova', 'Liam', 'Zoe'];
     const sampleDevices = ['iPhone 15 Pro', 'Samsung Galaxy S24', 'Google Pixel 8', 'iPad Air', 'OnePlus 12', 'MacBook Air'];
     
@@ -387,6 +505,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on(SOCKET_EVENTS.HOST_SIMULATE_CHALLENGE, (data, callback) => {
+    if (!guardHost(callback)) return;
     const active = Array.from(players.values()).filter(p => p.status === PLAYER_STATUS.ACTIVE);
     if (active.length < 2) {
       if (callback) callback({ success: false, message: 'Need at least 2 active players to simulate a challenge' });
@@ -395,33 +514,70 @@ io.on('connection', (socket) => {
 
     const pA = active[0];
     const pB = active[1];
-    const chId = 'ch_sim_' + Date.now();
-    const challenge = {
-      challengeId: chId,
-      playerAId: pA.playerId,
-      playerAName: pA.name,
-      playerBId: pB.playerId,
-      playerBName: pB.name,
-      similarityScore: 0.94,
-      status: CHALLENGE_STATUS.COUNTDOWN,
-      countdownRemaining: 60,
-      enteredPlayers: [],
-      createdAt: new Date().toISOString()
-    };
-
-    activeChallenges.set(chId, challenge);
     pA.status = PLAYER_STATUS.IN_CHALLENGE;
     pB.status = PLAYER_STATUS.IN_CHALLENGE;
 
-    addActivityLog(`Doppelganger Alert! ${pA.name} ⚡ ${pB.name} (Similarity: 94%)`, 'challenge');
-    
-    io.emit(SOCKET_EVENTS.CHALLENGE_CREATED, { challenge });
-    broadcastHostStatus();
-
+    const challenge = challengeManager.createChallenge(pA, pB, 0.94);
     if (callback) callback({ success: true, challenge });
   });
 
+  socket.on('host:simulate_disconnect', (data, callback) => {
+    if (!guardHost(callback)) return;
+    const { playerId } = data || {};
+    const p = players.get(playerId) || Array.from(players.values()).find(x => x.status === PLAYER_STATUS.ACTIVE);
+    if (p) {
+      p.status = PLAYER_STATUS.DISCONNECTED;
+      addActivityLog(`[SIMULATION] Network drop triggered on: ${p.name}`, 'disconnect');
+      io.emit(SOCKET_EVENTS.PLAYER_DISCONNECTED, { playerId: p.playerId, name: p.name });
+      broadcastHostStatus();
+      if (callback) callback({ success: true, player: p });
+    } else {
+      if (callback) callback({ success: false, message: 'No active player to disconnect' });
+    }
+  });
+
+  socket.on('host:simulate_victory', async (data, callback) => {
+    if (!guardHost(callback)) return;
+    const { gameId, winnerId } = data || {};
+    let targetGameId = gameId;
+    let targetWinnerId = winnerId;
+
+    if (!targetGameId) {
+      const activeGameEntry = Array.from(activeGames.entries())[0];
+      if (activeGameEntry) {
+        targetGameId = activeGameEntry[0];
+        const game = activeGameEntry[1];
+        targetWinnerId = targetWinnerId || game.playerA.playerId;
+      }
+    }
+
+    if (targetGameId && targetWinnerId) {
+      const matchResult = await gameManager.finishGame(targetGameId, targetWinnerId);
+      const winner = players.get(matchResult.winnerId);
+      const loser = players.get(matchResult.loserId);
+
+      await eliminatePlayerHelper(loser, winner, 'SIMULATED_VICTORY');
+      await royaleManager.handleMatchCompletion(targetGameId, matchResult.winnerId, matchResult.loserId, { reason: 'SIMULATED_VICTORY' });
+
+      addActivityLog(`[SIMULATION] Minigame victory simulated! Winner: ${winner?.name}`, 'game');
+      io.emit(SOCKET_EVENTS.GAME_FINISHED, {
+        gameId: targetGameId,
+        winnerId: matchResult.winnerId,
+        loserId: matchResult.loserId,
+        winnerName: winner?.name,
+        loserName: loser?.name,
+        scores: matchResult.scores,
+        reason: 'SIMULATED_VICTORY'
+      });
+      broadcastHostStatus();
+      if (callback) callback({ success: true, matchResult });
+    } else {
+      if (callback) callback({ success: false, message: 'No active game found to simulate victory' });
+    }
+  });
+
   socket.on(SOCKET_EVENTS.HOST_REMOVE_PLAYER, (payload, callback) => {
+    if (!guardHost(callback)) return;
     const { playerId } = payload || {};
     if (players.has(playerId)) {
       const p = players.get(playerId);

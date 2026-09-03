@@ -4,9 +4,12 @@ import {
   Bot, Trash2, Smartphone, ShieldCheck, Database, RefreshCw, AlertTriangle
 } from 'lucide-react';
 import { SOCKET_EVENTS, PLAYER_STATUS } from '../../../shared/events.js';
+import SimulationPanel from './SimulationPanel.jsx';
+import HotspotGuideModal from './HotspotGuideModal.jsx';
 
 export default function HostDashboard({ socket, isConnected, hostData, onRequestRefresh }) {
   const [showSimPanel, setShowSimPanel] = useState(false);
+  const [showHotspotModal, setShowHotspotModal] = useState(false);
   const [actionNotice, setActionNotice] = useState(null);
 
   const showNotification = (msg, type = 'info') => {
@@ -148,9 +151,19 @@ export default function HostDashboard({ socket, isConnected, hostData, onRequest
 
       {/* Quick Stats Bar */}
       <section className="stats-bar">
-        <div className="stat-card">
+        <div 
+          className="stat-card" 
+          onClick={() => setShowHotspotModal(true)}
+          style={{ cursor: 'pointer', transition: 'all 0.2s ease', position: 'relative' }}
+          title="Click to view full Hotspot Setup Guide & QR link"
+        >
           <div>
-            <div className="stat-label">Host IP & Join URL</div>
+            <div className="stat-label" style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+              <span>Host IP & Join URL</span>
+              <span style={{ fontSize: '0.7rem', color: '#00f2fe', background: 'rgba(0,242,254,0.1)', padding: '0.1rem 0.4rem', borderRadius: 4 }}>
+                SETUP GUIDE
+              </span>
+            </div>
             <div className="code-pill" style={{ marginTop: '0.3rem', fontSize: '0.95rem' }}>
               http://{hostIp}:5173
             </div>
@@ -216,25 +229,12 @@ export default function HostDashboard({ socket, isConnected, hostData, onRequest
 
       {/* Simulation Mode Drawer */}
       {showSimPanel && (
-        <div className="sim-panel">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 800, color: '#c084fc' }}>
-            <Bot size={20} />
-            <span>Virtual Player & Crisis Simulation Controls</span>
-          </div>
-          <div className="sim-buttons">
-            <button className="btn btn-secondary" onClick={() => handleSimulatePlayer()}>
-              +1 Random Virtual Player
-            </button>
-            <button className="btn btn-secondary" onClick={() => handleSimulateMultiple(5)}>
-              +5 Virtual Players
-            </button>
-            <button className="btn btn-secondary" onClick={() => handleSimulateMultiple(10)}>
-              +10 Players (Royale Ready)
-            </button>
-            <button className="btn btn-secondary" style={{ borderColor: 'rgba(255,0,127,0.4)', color: '#ff007f' }} onClick={handleSimulateDoppelganger}>
-              ⚡ Trigger Doppelganger (Jerrin vs Jerin)
-            </button>
-          </div>
+        <div style={{ marginBottom: '1.25rem' }}>
+          <SimulationPanel 
+            socket={socket} 
+            isConnected={isConnected} 
+            hostData={hostData} 
+          />
         </div>
       )}
 
@@ -404,6 +404,14 @@ export default function HostDashboard({ socket, isConnected, hostData, onRequest
 
         </div>
       </main>
+
+      {/* Hotspot Setup Guide & Diagnostic Modal */}
+      <HotspotGuideModal
+        isOpen={showHotspotModal}
+        onClose={() => setShowHotspotModal(false)}
+        hostIp={hostIp}
+        hostPort={5173}
+      />
     </div>
   );
 }
